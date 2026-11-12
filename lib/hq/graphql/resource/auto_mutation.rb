@@ -2,6 +2,7 @@
 
 require "hq/graphql/ext/mutation_extensions"
 require "hq/graphql/inputs"
+require "hq/graphql/record_authorization"
 require "hq/graphql/types"
 
 module HQ
@@ -13,8 +14,15 @@ module HQ
 
           build_mutation(action: :create) do
             define_method(:resolve) do |**args|
+              attributes = args[:attributes].format_nested_attributes
+              nested_errors = ::HQ::GraphQL::NestedAuthorization.errors(scoped_self.model_klass, attributes, context)
+              next { resource: nil, errors: nested_errors } if nested_errors.any?
+
               resource = scoped_self.new_record(context)
-              resource.assign_attributes(args[:attributes].format_nested_attributes)
+              resource.assign_attributes(attributes)
+              refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:create, resource, context)
+              next ::HQ::GraphQL::RecordAuthorization.payload(refusal) if refusal
+
               if resource.save
                 {
                   resource: resource,
@@ -43,7 +51,21 @@ module HQ
               resource = scoped_self.find_record(args, context)
 
               if resource
-                resource.assign_attributes(args[:attributes].format_nested_attributes)
+                attributes = args[:attributes].format_nested_attributes
+                nested_errors = ::HQ::GraphQL::NestedAuthorization.errors(scoped_self.model_klass, attributes, context)
+                next { resource: nil, errors: nested_errors } if nested_errors.any?
+
+                # Whose the record is now, then whose it would be left with: handing a record
+                # to a new owner is adding it there, which is a create, not an update.
+                stored_parents = ::HQ::GraphQL::RecordAuthorization.parents(resource, context)
+                refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:update, resource, context, parents: stored_parents)
+                next ::HQ::GraphQL::RecordAuthorization.payload(refusal) if refusal
+
+                resource.assign_attributes(attributes)
+                new_parents = ::HQ::GraphQL::RecordAuthorization.parents(resource, context) - stored_parents
+                refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:create, resource, context, parents: new_parents)
+                next ::HQ::GraphQL::RecordAuthorization.payload(refusal) if refusal
+
                 if resource.save
                   if return_copy
                     changed_attributes = resource.saved_changes.keys
@@ -87,6 +109,9 @@ module HQ
               resource = scoped_self.find_record(args, context)
 
               if resource
+                refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:copy, resource, context)
+                next ::HQ::GraphQL::RecordAuthorization.payload(refusal) if refusal
+
                 copy = resource.copy
                 if copy.save
                   {
@@ -117,6 +142,9 @@ module HQ
               resource = scoped_self.find_record(attrs, context)
 
               if resource
+                refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:destroy, resource, context)
+                next ::HQ::GraphQL::RecordAuthorization.payload(refusal) if refusal
+
                 if resource.destroy
                   {
                     resource: resource,
@@ -145,8 +173,23 @@ module HQ
           klass = Class.new(::GraphQL::Schema::Mutation) do
             graphql_name gql_name
 
+            # A bare `false` from `ready?` stops execution and returns null with
+            # NO error -- the client gets a 200, a null payload and nothing to
+            # tell "you may not do this" apart from "nothing happened", which
+            # reads to a form as a successful save. graphql-ruby takes
+            # `[false, early_return]` instead, so the refusal comes back in the
+            # payload's own `errors`, the same shape a denied nested attribute
+            # already produces.
             define_method(:ready?) do |**args|
-              super(**args) && ::HQ::GraphQL.authorized?(action, scoped_model_name, context)
+              ready = super(**args)
+              # Anything other than a plain go-ahead is already the caller's
+              # answer -- a refusal, or a tuple carrying its own early return.
+              return ready if ready.is_a?(::Array) || !ready
+              return true if ::HQ::GraphQL.authorized?(action, scoped_model_name, context)
+
+              message = ::HQ::GraphQL::AuthorizationMessage.for(action, scoped_model_name.constantize)
+              # String key, like every other key in this payload's `errors`.
+              [false, { resource: nil, errors: { "base" => [message] } }]
             end
 
             lazy_load do
@@ -165,7 +208,17 @@ module HQ
             end
 
             def errors_from_resource(resource)
-              resource.errors.to_h.deep_transform_keys { |k| k.to_s.camelize(:lower) }
+              # Rails 7 exposes validation errors through `messages`, while older versions
+              # may still rely on `to_h`. Keep both paths so this remains compatible across
+              # Rails versions and preserves the expected GraphQL error shape.
+              errors =
+                if resource.errors.respond_to?(:messages)
+                  resource.errors.messages
+                else
+                  resource.errors.to_h
+                end
+
+              errors.deep_transform_keys { |k| k.to_s.camelize(:lower) }
             end
           end
 

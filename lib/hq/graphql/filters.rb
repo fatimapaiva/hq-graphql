@@ -1,4 +1,5 @@
 # frozen_string_literal: true
+
 require "hq/graphql/filter_operations"
 require "hq/graphql/util"
 require "hq/graphql/filters/relative_date_expression"
@@ -116,13 +117,14 @@ module HQ
         return column if column.is_a?(Arel::Attributes::Attribute)
         return column if column.respond_to?(:relation) && column.respond_to?(:name)
 
-        arel_table = if scope.respond_to?(:arel_table)
-          scope.arel_table
-        elsif scope.respond_to?(:klass)
-          scope.klass.arel_table
-        else
-          raise ArgumentError, "Cannot determine table for provided scope"
-        end
+        arel_table =
+          if scope.respond_to?(:arel_table)
+            scope.arel_table
+          elsif scope.respond_to?(:klass)
+            scope.klass.arel_table
+          else
+            raise ArgumentError, "Cannot determine table for provided scope"
+          end
 
         arel_table[column.to_sym]
       end
@@ -145,9 +147,7 @@ module HQ
           @operations = normalize_operations(Array(operations))
         end
 
-        def graphql_name
-          @graphql_name
-        end
+        attr_reader :graphql_name
 
         def resolver?
           @resolver.present?
@@ -211,7 +211,20 @@ module HQ
         filters.reduce(model.all) do |scope, filter|
           filter_scope = filter.to_relation(model)
           next scope unless filter_scope
-          filter.is_or ? scope.or(filter_scope) : scope.merge(filter_scope)
+
+          if filter.is_or
+            scope.or(filter_scope)
+          else
+            # Rails' WhereClause#merge (used by Relation#merge) deduplicates predicates
+            # by column reference, so a second filter on the same column (e.g. LESS_THAN
+            # after GREATER_THAN on a date field) silently drops the first. Merge
+            # everything BUT the where clause (joins, left_outer_joins, eager_load,
+            # includes, group, having, etc. all carry over normally via merge), then
+            # add the where clause separately via where() (WhereClause#+), which
+            # concatenates without deduplication.
+            scope = scope.merge(filter_scope.except(:where))
+            filter_scope.where_clause.empty? ? scope : scope.where(filter_scope.where_clause.ast)
+          end
         end
       end
 
@@ -448,7 +461,6 @@ module HQ
         def range_operation?
           [DATE_RANGE_BETWEEN, DATE_RANGE_NOT_BETWEEN].include?(operation)
         end
-
       end
 
       class NumericFilter < Filter

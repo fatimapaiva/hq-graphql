@@ -25,8 +25,12 @@ module HQ
             self.authorized_action = action
           end
 
+          def authorize_objects(value)
+            @authorize_objects = value
+          end
+
           def authorized?(object, context)
-            super && ::HQ::GraphQL.authorized?(authorized_action, object, context)
+            super && (!authorize_objects? || ::HQ::GraphQL.authorized?(authorized_action, object, context))
           end
 
           def with_model(model_name, attributes: true, associations: true, auto_nil: true, enums: true)
@@ -54,23 +58,34 @@ module HQ
           end
 
           private
+
           attr_writer :authorized_action
 
           def authorized_action
             @authorized_action ||= :view
           end
 
+          def authorize_objects?
+            return @authorize_objects unless @authorize_objects.nil?
+            return superclass.authorize_objects? if superclass.respond_to?(:authorize_objects?)
+
+            true
+          end
+
           def field_from_association(association, auto_nil:, internal_association: false, &block)
             association_klass = association.klass
-            name              = association.name.to_s
+            name = association.name.to_s
             return if field_exists?(name)
 
             klass = model_klass
-            type  = Types[association_klass]
+            type = Types[association_klass]
+            # The class handed to `config.authorize_field`. See
+            # `HQ::GraphQL.authorize_association_target?`.
+            authorize_klass = ::HQ::GraphQL.authorize_association_target? ? association_klass.name : model_name
 
             case association.macro
             when :has_many
-              field name, [type], null: false, klass: model_name do
+              field name, [type], null: ::HQ::GraphQL.nullable_associations?, klass: authorize_klass do
                 if ::HQ::GraphQL.use_experimental_associations?
                   extension FieldExtension::PaginatedArguments, klass: association_klass
                   extension FieldExtension::PaginatedLoader, klass: klass, association: name, internal_association: internal_association
@@ -80,11 +95,11 @@ module HQ
                 instance_eval(&block) if block
               end
             when :has_one
-              field name, type, null: !auto_nil || !has_presence_validation?(association), klass: model_name do
+              field name, type, null: ::HQ::GraphQL.nullable_associations? || !auto_nil || !has_presence_validation?(association), klass: authorize_klass do
                 extension FieldExtension::AssociationLoaderExtension, klass: klass
               end
             else
-              field name, type, null: !auto_nil || !association_required?(association), klass: model_name do
+              field name, type, null: ::HQ::GraphQL.nullable_associations? || !auto_nil || !association_required?(association), klass: authorize_klass do
                 extension FieldExtension::AssociationLoaderExtension, klass: klass
               end
             end

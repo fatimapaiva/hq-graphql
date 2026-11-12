@@ -5,11 +5,19 @@ module HQ
     class Config < Struct.new(
       :authorize,
       :authorize_field,
+      :authorize_nested_attributes,
+      :record_parents,
       :default_object_class,
       :default_scope,
+      :default_search_type,
       :extract_class,
       :resource_lookup,
       :use_experimental_associations,
+      :nullable_associations,
+      :nullable_root_collections,
+      :authorize_association_target,
+      :apply_default_scope_to_associations,
+      :filter_unauthorized_collection_items,
       :excluded_inputs,
       keyword_init: true
     )

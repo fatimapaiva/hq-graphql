@@ -1,4 +1,4 @@
-require 'rails_helper'
+require "rails_helper"
 
 describe ::HQ::GraphQL::ObjectAssociation do
   let!(:organization_resource) do
@@ -10,6 +10,8 @@ describe ::HQ::GraphQL::ObjectAssociation do
       root_query
       query do
         has_many :custom_association, -> { where(inactive: nil) }, class_name: "User" do
+          apply_default_scope false
+          filter_unauthorized_items false
           argument :name, String, required: false
 
           scope do |name: nil|
@@ -34,7 +36,6 @@ describe ::HQ::GraphQL::ObjectAssociation do
     Class.new(::HQ::GraphQL::RootQuery)
   end
 
-
   let(:schema) do
     Class.new(::GraphQL::Schema) do
       query(RootQuery)
@@ -52,6 +53,16 @@ describe ::HQ::GraphQL::ObjectAssociation do
     it "adds a custom association field" do
       expect(organization_resource.query_object.fields.keys).to include("customAssociation")
     end
+
+    it "allows association fields to opt out of global scoping and filtering" do
+      allow(::HQ::GraphQL.config).to receive(:apply_default_scope_to_associations) { true }
+      allow(::HQ::GraphQL.config).to receive(:filter_unauthorized_collection_items) { true }
+
+      field = organization_resource.query_object.fields.fetch("customAssociation")
+
+      expect(field.apply_default_scope?).to be(false)
+      expect(field.filter_unauthorized_items?).to be(false)
+    end
   end
 
   context "execution" do
@@ -61,16 +72,16 @@ describe ::HQ::GraphQL::ObjectAssociation do
     let!(:user3) { ::FactoryBot.create(:user, organization: organization) }
 
     let(:find_organization) { <<~GRAPHQL
-        query FindOrganization($id: ID!, $userName: String) {
-          organization(id: $id) {
+      query FindOrganization($id: ID!, $userName: String) {
+        organization(id: $id) {
+          id
+          customAssociation(name: $userName) {
             id
-            customAssociation(name: $userName) {
-              id
-              name
-            }
+            name
           }
         }
-      GRAPHQL
+      }
+    GRAPHQL
     }
 
     it "finds active users" do

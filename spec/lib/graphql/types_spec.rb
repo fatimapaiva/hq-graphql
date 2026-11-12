@@ -1,4 +1,4 @@
-require 'rails_helper'
+require "rails_helper"
 
 describe ::HQ::GraphQL::Types do
 
@@ -26,7 +26,9 @@ describe ::HQ::GraphQL::Types do
         expect(type_object.superclass).to eql(::GraphQL::Schema::Object)
         expect(type_object).to eql(described_class[Advisor])
         expect(type_object.fields.keys).to contain_exactly("customField")
+
         type_object.lazy_load!
+
         expect(type_object.fields.keys).to contain_exactly("customField")
       end
     end
@@ -44,11 +46,63 @@ describe ::HQ::GraphQL::Types do
         include ::HQ::GraphQL::Resource
         self.model_name = "Agent"
       end
+
       expect(sti_resource.query_object).to eql(described_class["Agent"])
     end
 
     it "falls back to the base class" do
       expect(type_object).to eql(described_class["Agent"])
+    end
+  end
+
+  describe ".subtypes" do
+    let!(:advisor_resource) do
+      Class.new do
+        include ::HQ::GraphQL::Resource
+        self.model_name = "Advisor"
+      end
+    end
+
+    # Agent < Advisor (STI)
+    before(:each) { Agent } # ensure the subclass is loaded so descendants sees it
+
+    context "when only the base class has a registered resource" do
+      it "collapses subclasses that fall back to the base type" do
+        expect(described_class.subtypes(Advisor)).to contain_exactly(advisor_resource.query_object)
+      end
+
+      it "includes the base type when looked up from a subclass" do
+        expect(described_class.subtypes(Advisor)).to include(described_class[Agent])
+      end
+    end
+
+    context "when a subclass has its own registered resource" do
+      let!(:agent_resource) do
+        Class.new do
+          include ::HQ::GraphQL::Resource
+          self.model_name = "Agent"
+        end
+      end
+
+      it "includes both the base type and the subclass type" do
+        expect(described_class.subtypes(Advisor)).to contain_exactly(
+          advisor_resource.query_object,
+          agent_resource.query_object
+        )
+      end
+
+      it "accepts the base class as a string" do
+        expect(described_class.subtypes("Advisor")).to contain_exactly(
+          advisor_resource.query_object,
+          agent_resource.query_object
+        )
+      end
+    end
+
+    context "when the class has no registered resource" do
+      it "returns an empty array" do
+        expect(described_class.subtypes(Organization)).to eq([])
+      end
     end
   end
 

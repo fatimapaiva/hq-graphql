@@ -1,4 +1,4 @@
-require 'rails_helper'
+require "rails_helper"
 
 describe ::HQ::GraphQL::Filters do
   include ActiveSupport::Testing::TimeHelpers
@@ -103,6 +103,16 @@ describe ::HQ::GraphQL::Filters do
         )
       end
 
+      # only exercises left_outer_joins to prove it survives being combined
+      # with another filter in FilterSet#to_scope — see "relation attributes
+      # beyond where/joins" spec below
+      filter_field :with_self_reference,
+                   type: :boolean,
+                   graphql_name: "withSelfReference",
+                   operations: [:WITH] do |scope, value:, **|
+        value.to_s.casecmp("t").zero? ? scope.left_outer_joins(:self_reference) : scope
+      end
+
       root_query
     end
   end
@@ -128,7 +138,7 @@ describe ::HQ::GraphQL::Filters do
           }
         }
       }
-    GRAPHQL
+  GRAPHQL
   }
 
   before(:each) do
@@ -139,22 +149,23 @@ describe ::HQ::GraphQL::Filters do
   it "generates enums of filterable fields" do
     resource::FilterFields.lazy_load!
     expect(resource::FilterFields.values.keys).to contain_exactly(
-      "id",
-      "count",
-      "amount",
-      "isBool",
-      "name",
-      "createdDate",
-      "createdAt",
-      "updatedAt",
-      "countPlusOne",
-      "createdRecently",
-      "relatedCreatedRecently",
-      "countFiltered",
-      "nameFiltered",
-      "idFiltered",
-      "boolFiltered"
-    )
+                                                    "id",
+                                                    "count",
+                                                    "amount",
+                                                    "isBool",
+                                                    "name",
+                                                    "createdDate",
+                                                    "createdAt",
+                                                    "updatedAt",
+                                                    "countPlusOne",
+                                                    "createdRecently",
+                                                    "relatedCreatedRecently",
+                                                    "countFiltered",
+                                                    "nameFiltered",
+                                                    "idFiltered",
+                                                    "boolFiltered",
+                                                    "withSelfReference"
+                                                  )
 
     resource::FilterColumnFields.lazy_load!
     expect(resource::FilterColumnFields.values.keys).to contain_exactly("id", "count", "amount", "isBool", "name", "createdDate", "createdAt", "updatedAt")
@@ -216,6 +227,18 @@ describe ::HQ::GraphQL::Filters do
       data = results["data"]["testTypes"]["nodes"]
       expect(data.length).to be 10
       expect(data.map { |d| d["id"] }).to contain_exactly(*test_types.map(&:id))
+    end
+
+    it "applies GREATER_THAN and LESS_THAN on the same column as an AND range" do
+      results = schema.execute(query, variables: {
+        filters: [
+          { field: "createdAt", operation: "GREATER_THAN", value: 1.day.ago.iso8601 },
+          { field: "createdAt", operation: "LESS_THAN", value: 1.day.from_now.iso8601 }
+        ]
+      })
+      data = results["data"]["testTypes"]["nodes"]
+      expect(data.length).to be 1
+      expect(data[0]["id"]).to eql(target.id)
     end
 
     it "filters test_types using OR statement" do
@@ -304,6 +327,18 @@ describe ::HQ::GraphQL::Filters do
       expect(data.map { |d| d["id"] }).to contain_exactly(*test_types.map(&:id))
     end
 
+    it "applies GREATER_THAN and LESS_THAN on the same column as an AND range" do
+      results = schema.execute(query, variables: {
+        filters: [
+          { field: "count", operation: "GREATER_THAN", value: "5" },
+          { field: "count", operation: "LESS_THAN", value: "8" }
+        ]
+      })
+      data = results["data"]["testTypes"]["nodes"]
+      # counts 6, 7 only — both bounds must be active
+      expect(data.map { |d| d["id"] }).to contain_exactly(*test_types.select { |t| t.count > 5 && t.count < 8 }.map(&:id))
+    end
+
     it "filters test_types using EQUAL" do
       target = test_types.sample
       results = schema.execute(query, variables: { filters: [{ field: "count", operation: "EQUAL", value: target.count.to_s }] })
@@ -329,15 +364,28 @@ describe ::HQ::GraphQL::Filters do
       target_two = TestType.create(count: 12)
       results = schema.execute(query, variables: { filters: [
         { field: "count", operation: "EQUAL", value: target.count.to_s },
-        { field: "count", operation: "EQUAL", value: target_two.count.to_s, isOr: true},
+        { field: "count", operation: "EQUAL", value: target_two.count.to_s, isOr: true },
         { field: "count", operation: "IN", arrayValues: [target.count.to_s, target_two.count.to_s], isOr: true }
-        ]})
+      ] })
       data = results["data"]["testTypes"]["nodes"]
       expect(data.length).to be 2
       expect(data[0]["id"]).to eql(target_two.id)
       expect(data[1]["id"]).to eql(target.id)
     end
 
+    it "combines an AND range on the same column with an OR filter on that same column" do
+      out_of_range = TestType.create(count: 50)
+      results = schema.execute(query, variables: {
+        filters: [
+          { field: "count", operation: "GREATER_THAN", value: "3" },
+          { field: "count", operation: "LESS_THAN", value: "6" },
+          { field: "count", operation: "EQUAL", value: "50", isOr: true }
+        ]
+      })
+      data = results["data"]["testTypes"]["nodes"]
+      expected_ids = test_types.select { |t| t.count > 3 && t.count < 6 }.map(&:id) + [out_of_range.id]
+      expect(data.map { |d| d["id"] }).to contain_exactly(*expected_ids)
+    end
 
     it "only supports numerical values" do
       results = schema.execute(query, variables: { filters: [{ field: "count", operation: "GREATER_THAN", value: "Fizz" }] })
@@ -407,9 +455,9 @@ describe ::HQ::GraphQL::Filters do
       target_two = TestType.create(name: "Unique Name Two")
       results = schema.execute(query, variables: { filters: [
         { field: "name", operation: "EQUAL", value: target.name },
-        { field: "name", operation: "EQUAL", value: target_two.name, isOr: true},
+        { field: "name", operation: "EQUAL", value: target_two.name, isOr: true },
         { field: "name", operation: "IN", arrayValues: [target.name, target_two.name], isOr: true }
-        ]})
+      ] })
       data = results["data"]["testTypes"]["nodes"]
       expect(data.length).to be 2
       expect(data[0]["id"]).to eql(target_two.id)
@@ -455,9 +503,9 @@ describe ::HQ::GraphQL::Filters do
       target_two = TestType.create
       results = schema.execute(query, variables: { filters: [
         { field: "id", operation: "EQUAL", value: target.id },
-        { field: "id", operation: "EQUAL", value: target_two.id, isOr: true},
+        { field: "id", operation: "EQUAL", value: target_two.id, isOr: true },
         { field: "id", operation: "IN", arrayValues: [target.id, target_two.id], isOr: true }
-        ]})
+      ] })
       data = results["data"]["testTypes"]["nodes"]
       expect(data.length).to be 2
       expect(data[0]["id"]).to eql(target_two.id)
@@ -507,6 +555,19 @@ describe ::HQ::GraphQL::Filters do
       data = results["data"]["testTypes"]["nodes"]
       expect(data.length).to be 2
       expect(data.map { |d| d["id"] }).to contain_exactly(*test_types.select { |t| t.count < 2 }.map(&:id))
+    end
+
+    it "applies GREATER_THAN and LESS_THAN on the same custom field as an AND range" do
+      results = schema.execute(query, variables: {
+        filters: [
+          { field: "countPlusOne", operation: "GREATER_THAN", value: "3" },
+          { field: "countPlusOne", operation: "LESS_THAN", value: "6" }
+        ]
+      })
+      data = results["data"]["testTypes"]["nodes"]
+      # count+1 > 3 AND count+1 < 6 → counts 3, 4 only
+      expected_ids = test_types.select { |t| !t.count.nil? && t.count + 1 > 3 && t.count + 1 < 6 }.map(&:id)
+      expect(data.map { |d| d["id"] }).to contain_exactly(*expected_ids)
     end
 
     it "rejects unsupported operations" do
@@ -608,6 +669,26 @@ describe ::HQ::GraphQL::Filters do
       results = schema.execute(query, variables: { filters: [{ field: "boolFiltered", operation: "WITH", value: "t" }] })
       ids = results["data"]["testTypes"]["nodes"].map { |node| node["id"] }
       expect(ids).to include(bool_record.id)
+    end
+  end
+
+  context "relation attributes beyond where/joins" do
+    let!(:target) { TestType.create(count: 11) }
+
+    it "keeps a left_outer_joins added by a custom field when combined with another filter" do
+      captured_sql = []
+      subscriber = ->(*, payload) { captured_sql << payload[:sql] }
+
+      results = nil
+      ActiveSupport::Notifications.subscribed(subscriber, "sql.active_record") do
+        results = schema.execute(query, variables: { filters: [
+          { field: "withSelfReference", operation: "WITH", value: "t" },
+          { field: "count", operation: "GREATER_THAN", value: "5" }
+        ] })
+      end
+
+      expect(results["errors"]).to be_nil
+      expect(captured_sql.join("\n")).to match(/LEFT OUTER JOIN "test_types"/i)
     end
   end
 

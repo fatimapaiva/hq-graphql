@@ -1,4 +1,4 @@
-require 'rails_helper'
+require "rails_helper"
 
 describe ::HQ::GraphQL::Resource do
   let(:organization_type) do
@@ -238,11 +238,13 @@ describe ::HQ::GraphQL::Resource do
     it "removes name" do
       ::HQ::GraphQL::Inputs[Advisor].lazy_load!
       expected = ["id", "nickname", "organizationId", "createdAt", "updatedAt", "X"]
+
       expect(::HQ::GraphQL::Inputs[Advisor].arguments.keys).to contain_exactly(*expected)
     end
 
     it "customizes graphql name" do
       ::HQ::GraphQL::Inputs[Advisor].lazy_load!
+
       expect(::HQ::GraphQL::Inputs[Advisor].graphql_name).to eql("CustomAdvisorInput")
     end
   end
@@ -320,7 +322,8 @@ describe ::HQ::GraphQL::Resource do
   end
 
   describe ".def_root" do
-    let(:find_onehq) { <<-GRAPHQL
+    let(:find_onehq) {
+      <<-GRAPHQL
         query advisorsNamedOneHq {
           advisorsNamedOneHq {
             nodes {
@@ -364,6 +367,152 @@ describe ::HQ::GraphQL::Resource do
     end
   end
 
+  describe ".search_options" do
+    let(:advisor_resource) do
+      Class.new do
+        include ::HQ::GraphQL::Resource
+        self.model_name = "Advisor"
+      end
+    end
+
+    let(:search_result_type) do
+      resource = advisor_resource
+      Class.new(::GraphQL::Schema::Object) do
+        graphql_name "AdvisorSearchResultType"
+        field :results, [resource.query_object], null: false
+        field :grouped_results, ::GraphQL::Types::JSON, null: true
+      end
+    end
+
+    let(:search_query) {
+      <<-GRAPHQL
+        query {
+          advisorSearchOptions(query: "Bob") {
+            results {
+              name
+            }
+          }
+        }
+      GRAPHQL
+    }
+
+    before(:each) do
+      allow(::HQ::GraphQL.config).to receive(:default_search_type) { search_result_type }
+    end
+
+    context "when the model defines .search_options" do
+      before(:each) do
+        Advisor.define_singleton_method(:search_options) do |query, **_opts|
+          Advisor.where("name ILIKE ?", "%#{query}%")
+        end
+      end
+
+      after(:each) do
+        Advisor.singleton_class.remove_method(:search_options)
+      end
+
+      it "auto-registers the field without an explicit call" do
+        ::HQ::GraphQL.auto_register_search_options!
+
+        FactoryBot.create(:advisor, name: "Alice")
+        bob = FactoryBot.create(:advisor, name: "Bob")
+
+        results = schema.execute(search_query)
+        names = results["data"]["advisorSearchOptions"]["results"].map { |r| r["name"] }
+
+        expect(names).to contain_exactly(bob.name)
+      end
+    end
+
+    context "when an Owner-prefixed class exists for the model" do
+      let(:search_result_type) do
+        resource = advisor_resource
+        Class.new(::GraphQL::Schema::Object) do
+          graphql_name "AdvisorSearchResultType"
+          field :results, [resource.query_object], null: false
+          field :grouped_results, ::GraphQL::Types::JSON, null: true
+          field :result_class_names, [String], null: false
+
+          define_method(:result_class_names) { object[:results].map { |r| r.class.name } }
+        end
+      end
+
+      let(:search_query) {
+        <<-GRAPHQL
+          query {
+            advisorSearchOptions(query: "Bob") {
+              resultClassNames
+            }
+          }
+        GRAPHQL
+      }
+
+      before(:each) do
+        stub_const("OwnerAdvisor", Class.new(::ActiveRecord::Base) { self.table_name = "advisors" })
+
+        Advisor.define_singleton_method(:search_options) do |query, **_opts|
+          Advisor.where("name ILIKE ?", "%#{query}%")
+        end
+      end
+
+      after(:each) do
+        Advisor.singleton_class.remove_method(:search_options)
+      end
+
+      it "remaps results to the Owner-prefixed class by id" do
+        ::HQ::GraphQL.auto_register_search_options!
+
+        FactoryBot.create(:advisor, name: "Bob")
+
+        results = schema.execute(search_query)
+        class_names = results["data"]["advisorSearchOptions"]["resultClassNames"]
+
+        expect(class_names).to eq(["OwnerAdvisor"])
+      end
+
+      context "when the Owner-prefixed class has no primary key configured (e.g. a DB view)" do
+        before(:each) { OwnerAdvisor.primary_key = nil }
+
+        it "still remaps results to the Owner-prefixed class by id" do
+          ::HQ::GraphQL.auto_register_search_options!
+
+          FactoryBot.create(:advisor, name: "Bob")
+
+          results = schema.execute(search_query)
+          class_names = results["data"]["advisorSearchOptions"]["resultClassNames"]
+
+          expect(class_names).to eq(["OwnerAdvisor"])
+        end
+      end
+    end
+
+    context "when the model doesn't define .search_options" do
+      it "doesn't register the field" do
+        ::HQ::GraphQL.auto_register_search_options!
+
+        expect(::HQ::GraphQL.root_queries.map { |q| q[:field_name] }).not_to include("advisor_search_options")
+      end
+    end
+
+    context "when a model gains .search_options after an earlier call" do
+      after(:each) do
+        if Advisor.respond_to?(:search_options)
+          Advisor.singleton_class.remove_method(:search_options)
+        end
+      end
+
+      it "picks it up on the next call -- stateless, no reset needed" do
+        ::HQ::GraphQL.auto_register_search_options!
+        expect(::HQ::GraphQL.root_queries.map { |q| q[:field_name] }).not_to include("advisor_search_options")
+
+        Advisor.define_singleton_method(:search_options) { |query, **_opts| Advisor.where(nil) }
+        ::HQ::GraphQL.auto_register_search_options!
+
+        expect(::HQ::GraphQL.root_queries.map { |q| q[:field_name] }).to include("advisor_search_options")
+      end
+    end
+  end
+
   describe ".excluded_inputs" do
     let(:advisor_resource) do
       Class.new do
@@ -394,22 +543,26 @@ describe ::HQ::GraphQL::Resource do
 
     it "strips /^Resources/ and /Resource$/" do
       c = build_resource("Resources::OrganizationResource")
+
       expect(c.model_klass).to eq Organization
     end
 
     it "strips /^Resources/" do
       c = build_resource("Resources::Organization")
+
       expect(c.model_klass).to eq Organization
     end
 
     it "strips /Resource$/" do
       c = build_resource("OrganizationResource")
+
       expect(c.model_klass).to eq Organization
     end
   end
 
   context "execution" do
-    let(:find_advisor) { <<-GRAPHQL
+    let(:find_advisor) {
+      <<-GRAPHQL
         query findAdvisor($id: ID!) {
           advisor(id: $id) {
             name
@@ -422,7 +575,8 @@ describe ::HQ::GraphQL::Resource do
       GRAPHQL
     }
 
-    let(:find_advisors) { <<-GRAPHQL
+    let(:find_advisors) {
+      <<-GRAPHQL
         query findAdvisors($first: Int, $limit: Int) {
           advisors(first: $first, limit: $limit) {
             nodes {
@@ -437,7 +591,8 @@ describe ::HQ::GraphQL::Resource do
       GRAPHQL
     }
 
-    let(:create_mutation) { <<-GRAPHQL
+    let(:create_mutation) {
+      <<-GRAPHQL
         mutation createAdvisor($attributes: AdvisorInput!) {
           createAdvisor(attributes: $attributes) {
             errors
@@ -463,10 +618,11 @@ describe ::HQ::GraphQL::Resource do
             }
           }
         }
-      GRAPHQL
+    GRAPHQL
     }
 
-    let(:destroy_mutation) { <<-GRAPHQL
+    let(:destroy_mutation) {
+      <<-GRAPHQL
         mutation destroyAdvisor($id: ID!) {
           destroyAdvisor(id: $id) {
             errors
@@ -478,7 +634,8 @@ describe ::HQ::GraphQL::Resource do
       GRAPHQL
     }
 
-    let(:new_advisor) { <<-GRAPHQL
+    let(:new_advisor) {
+      <<-GRAPHQL
         query newAdvisor {
           newAdvisor {
             name
@@ -516,6 +673,7 @@ describe ::HQ::GraphQL::Resource do
       10.times { FactoryBot.create(:advisor) }
       results = schema.execute(find_advisors, variables: { first: 5 })
       data = results["data"]["advisors"]["nodes"]
+
       expect(data.length).to be 5
     end
 
@@ -523,6 +681,7 @@ describe ::HQ::GraphQL::Resource do
       251.times { FactoryBot.create(:advisor) }
       results = schema.execute(find_advisors, variables: {})
       data = results["data"]["advisors"]["nodes"]
+
       expect(data.length).to be 250
     end
 
@@ -532,6 +691,7 @@ describe ::HQ::GraphQL::Resource do
       nickname = "Bobby"
       results = schema.execute(create_mutation, variables: { attributes: { name: name, nickname: nickname, organizationId: organization.id } })
       data = results["data"]
+
       aggregate_failures do
         expect(data["errors"]).to be_nil
         expect(data["createAdvisor"]["resource"]["name"]).to eql name
@@ -552,8 +712,8 @@ describe ::HQ::GraphQL::Resource do
           organization: { id: advisor.organization_id, name: organization_name }
         }
       })
-
       data = results["data"]
+
       aggregate_failures do
         expect(data["errors"]).to be_nil
         expect(data["updateAdvisor"]["resource"]["name"]).to eql name
@@ -566,8 +726,8 @@ describe ::HQ::GraphQL::Resource do
     it "destroys" do
       advisor = FactoryBot.create(:advisor)
       results = schema.execute(destroy_mutation, variables: { id: advisor.id })
-
       data = results["data"]
+
       aggregate_failures do
         expect(data["errors"]).to be_nil
         expect(data["destroyAdvisor"]["resource"]["name"]).to eql advisor.name
@@ -578,6 +738,7 @@ describe ::HQ::GraphQL::Resource do
     it "uses new" do
       results = schema.execute(new_advisor)
       data = results["data"]["newAdvisor"]
+
       expect(data.length).to be 2
     end
 
@@ -591,6 +752,7 @@ describe ::HQ::GraphQL::Resource do
         end
         results = schema.execute(find_advisor, variables: { id: advisor.id })
         data = results["data"]
+
         expect(data["advisor"]).to be_nil
       end
 
@@ -606,7 +768,10 @@ describe ::HQ::GraphQL::Resource do
         data = results["data"]
 
         aggregate_failures do
-          expect(data["createAdvisor"]).to be_nil
+          # A refusal has to be legible to the caller: a bare null reads to a
+          # form as "nothing happened", i.e. as a successful save.
+          expect(data["createAdvisor"]["resource"]).to be_nil
+          expect(data["createAdvisor"]["errors"]).to eq({ "base" => ["You are not allowed to create advisors"] })
           expect(Advisor.where(name: name).exists?).to eql false
         end
       end
@@ -628,10 +793,11 @@ describe ::HQ::GraphQL::Resource do
             organization: { id: advisor.organization_id, name: organization_name }
           }
         })
-
         data = results["data"]
+
         aggregate_failures do
-          expect(data["updateAdvisor"]).to be_nil
+          expect(data["updateAdvisor"]["resource"]).to be_nil
+          expect(data["updateAdvisor"]["errors"]).to eq({ "base" => ["You are not allowed to update advisors"] })
           expect(Advisor.find(advisor.id).name).to eql advisor.name
           expect(Organization.find(advisor.organization_id).name).to eql advisor.organization.name
         end
@@ -645,10 +811,11 @@ describe ::HQ::GraphQL::Resource do
         end
         advisor = FactoryBot.create(:advisor)
         results = schema.execute(destroy_mutation, variables: { id: advisor.id })
-
         data = results["data"]
+
         aggregate_failures do
-          expect(data["destroyAdvisor"]).to be_nil
+          expect(data["destroyAdvisor"]["resource"]).to be_nil
+          expect(data["destroyAdvisor"]["errors"]).to eq({ "base" => ["You are not allowed to delete advisors"] })
           expect(Advisor.where(id: advisor.id).exists?).to eql true
         end
       end
@@ -674,8 +841,8 @@ describe ::HQ::GraphQL::Resource do
             name: "Bob"
           }
         })
-
         data = results["data"]
+
         aggregate_failures do
           expect(data["updateAdvisor"]["errors"]).to be_present
           expect(data["updateAdvisor"]["resource"]).to be_nil
@@ -707,8 +874,8 @@ describe ::HQ::GraphQL::Resource do
             name: "Bob"
           }
         })
-
         data = results["data"]
+
         aggregate_failures do
           expect(data["updateAdvisor"]["errors"]).to be_present
           expect(data["updateAdvisor"]["resource"]).to be_nil
