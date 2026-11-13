@@ -40,6 +40,18 @@ module HQ
         config.authorize_nested_attributes.call(action, klass, parent_klass, context)
     end
 
+    # What changed on `record` since `since` (a Time the client got from a
+    # previous `return_copy: true` update), including changes made by other users
+    # or processes. The host sets `config.changes_since` to a callable taking
+    # `record:, since:, associations:, context:` (associations are the model's
+    # reflections) and returning `{ columns: [...], associations: [...] }`, or nil
+    # when it can't tell -- in which case the full record is returned.
+    def self.changes_since(record:, since:, associations:, context:)
+      return nil unless config.changes_since
+
+      config.changes_since.call(record: record, since: since, associations: associations, context: context)
+    end
+
     def self.default_scope(scope, context)
       config.default_scope.call(scope, context)
     end

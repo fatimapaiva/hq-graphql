@@ -157,11 +157,55 @@ describe ::HQ::GraphQL::Resource do
       expect(advisor_resource.query_object.superclass).to be(new_class)
     end
 
+    context "with a custom field argument, without return_copy" do
+      let(:advisor_resource) do
+        Class.new do
+          include ::HQ::GraphQL::Resource
+          self.model_name = "Advisor"
+
+          mutations
+
+          query do
+            field :name, String, null: false do
+              argument :shout, ::GraphQL::Types::Boolean, required: false
+            end
+          end
+        end
+      end
+
+      it "keeps the plain copy query object, without the query block or gated fields" do
+        query_object = ::HQ::GraphQL::Types[Advisor]
+        query_object.lazy_load!
+        nil_query_object = ::HQ::GraphQL::Types[Advisor, true]
+        nil_query_object.lazy_load!
+
+        aggregate_failures do
+          expect(query_object.fields["name"].arguments.keys).to contain_exactly("shout")
+          expect(nil_query_object.fields["name"].arguments.keys).to be_empty
+          expect(nil_query_object.fields["name"].extensions.map(&:class)).not_to include(::HQ::GraphQL::ChangedAttributesProxy::FieldGate)
+          expect(nil_query_object).not_to be_a(::HQ::GraphQL::Resource::NullableCopyFields)
+        end
+      end
+
+      it "keeps the update mutation as it was" do
+        update_mutation = advisor_resource.mutation_klasses[:update_advisor]
+        update_mutation.lazy_load!
+
+        aggregate_failures do
+          expect(update_mutation.fields.keys).to contain_exactly("errors", "resource")
+          expect(update_mutation.arguments.keys).to contain_exactly("id", "attributes")
+          expect(update_mutation.fields["resource"].type.graphql_name).to eql("Advisor")
+        end
+      end
+    end
+
     context "with a custom field argument" do
       let(:advisor_resource) do
         Class.new do
           include ::HQ::GraphQL::Resource
           self.model_name = "Advisor"
+
+          mutations return_copy: true
 
           query do
             field :nickname, String, null: false do
@@ -175,7 +219,7 @@ describe ::HQ::GraphQL::Resource do
         end
       end
 
-      it "carries the custom field and its argument over to the nilable copy query object" do
+      it "with return_copy, carries the custom field and its argument over to the nilable copy query object" do
         query_object = ::HQ::GraphQL::Types[Advisor]
         query_object.lazy_load!
         nil_query_object = ::HQ::GraphQL::Types[Advisor, true]
@@ -188,22 +232,24 @@ describe ::HQ::GraphQL::Resource do
       end
     end
 
-    context "with a custom field forced non-null via auto_nil" do
+    context "with a custom field declared non-null" do
       let(:advisor_resource) do
         Class.new do
           include ::HQ::GraphQL::Resource
           self.model_name = "Advisor"
 
+          mutations return_copy: true
+
           query do
             # mirrors advisor_resource.rb's `field :name, String, null: false` pattern,
             # backed by a guarantee (e.g. a DB trigger) that only holds for the regular
             # type — the nilable copy type must stay nullable regardless.
-            field :name, String, null: !auto_nil
+            field :name, String, null: false
           end
         end
       end
 
-      it "is non-null on the regular query object but nullable on the nil/copy query object" do
+      it "with return_copy, is non-null on the regular query object but nullable on the nil/copy query object" do
         query_object = ::HQ::GraphQL::Types[Advisor]
         query_object.lazy_load!
         nil_query_object = ::HQ::GraphQL::Types[Advisor, true]
@@ -305,17 +351,18 @@ describe ::HQ::GraphQL::Resource do
         end
       end
 
-      it "adds a changedAttributes field and types resource as the nilable copy type" do
+      it "adds changedSince, changedAttributes and syncedAt, and types resource as the nilable copy type" do
         update_mutation = advisor_resource.mutation_klasses[:update_advisor]
         update_mutation.lazy_load!
 
         aggregate_failures do
-          expected_fields = ["errors", "resource", "changedAttributes"]
+          expected_fields = ["errors", "resource", "changedAttributes", "syncedAt"]
           expect(update_mutation.fields.keys).to contain_exactly(*expected_fields)
+          expect(update_mutation.arguments.keys).to contain_exactly("id", "attributes", "changedSince")
 
           resource_field_type = update_mutation.fields["resource"].type
           expect(resource_field_type.graphql_name).to eql(::HQ::GraphQL::Types[Advisor, true].graphql_name)
-          expect(update_mutation.fields["changedAttributes"].type.to_type_signature).to eql("[String!]!")
+          expect(update_mutation.fields["changedAttributes"].type.to_type_signature).to eql("[String!]")
         end
       end
     end
@@ -910,18 +957,18 @@ describe ::HQ::GraphQL::Resource do
       end
     end
 
-    it "only returns changed attributes on resource, and lists them in changedAttributes" do
-      advisor = FactoryBot.create(:advisor)
-
-      results = schema.execute(<<-GRAPHQL, variables: { id: advisor.id, attributes: { name: "Bob" } })
-        mutation updateAdvisor($id: ID!, $attributes: AdvisorInput!) {
-          updateAdvisor(id: $id, attributes: $attributes) {
+    let(:update_query) do
+      <<-GRAPHQL
+        mutation updateAdvisor($id: ID!, $attributes: AdvisorInput!, $changedSince: ISO8601DateTime) {
+          updateAdvisor(id: $id, attributes: $attributes, changedSince: $changedSince) {
             errors
             changedAttributes
+            syncedAt
             resource {
               id
               name
               nickname
+              organizationId
               organization {
                 name
               }
@@ -929,20 +976,105 @@ describe ::HQ::GraphQL::Resource do
           }
         }
       GRAPHQL
+    end
 
-      data = results["data"]["updateAdvisor"]
+    let(:advisor) { FactoryBot.create(:advisor) }
+    let(:since) { 1.minute.ago.iso8601 }
+
+    def update(attributes, changed_since: nil)
+      results = schema.execute(update_query, variables: { id: advisor.id, attributes: attributes, changedSince: changed_since })
+      expect(results["errors"]).to be_nil
+      results["data"]["updateAdvisor"]
+    end
+
+    def changes_since(result)
+      allow(::HQ::GraphQL.config).to receive(:changes_since) { ->(**_kwargs) { result } }
+    end
+
+    it "returns the full record, with null changedAttributes, when changedSince is not given" do
+      data = update({ name: "Bob" })
+
       aggregate_failures do
         expect(data["errors"]).to eql({})
-        expect(data["changedAttributes"]).to include("name")
-        expect(data["changedAttributes"]).not_to include("nickname")
+        expect(data["changedAttributes"]).to be_nil
+        expect(data["syncedAt"]).to be_present
+        expect(data["resource"]["name"]).to eql("Bob")
+        expect(data["resource"]["nickname"]).to eql(advisor.nickname)
+        expect(data["resource"]["organization"]["name"]).to eql(advisor.organization.name)
+      end
+    end
+
+    it "returns the full record when the host can't tell what changed since then" do
+      changes_since(nil)
+      data = update({ name: "Bob" }, changed_since: since)
+
+      aggregate_failures do
+        expect(data["changedAttributes"]).to be_nil
+        expect(data["resource"]["nickname"]).to eql(advisor.nickname)
+      end
+    end
+
+    it "only returns this save's changes, plus what the host reports changed since then" do
+      # e.g. another user changed the nickname after this form loaded
+      changes_since({ columns: ["nickname"], associations: [] })
+      data = update({ name: "Bob" }, changed_since: since)
+
+      aggregate_failures do
+        expect(data["errors"]).to eql({})
+        expect(data["changedAttributes"]).to include("name", "nickname", "updatedAt")
+        expect(data["changedAttributes"]).not_to include("organizationId", "organization")
         expect(data["resource"]["id"]).to eql(advisor.id)
         expect(data["resource"]["name"]).to eql("Bob")
-        expect(data["resource"]["nickname"]).to be_nil
+        expect(data["resource"]["nickname"]).to eql(advisor.nickname)
+        expect(data["resource"]["organizationId"]).to be_nil
+        # untouched association: hidden, not loaded
+        expect(data["resource"]["organization"]).to be_nil
         expect(Advisor.find(advisor.id).nickname).to eql(advisor.nickname)
-        # Associations must still resolve normally (not nilled, not broken by the
-        # proxy) — this is the AssociationLoader/Preloader codepath, which relies
-        # on `record.is_a?(model)` and `record.class` matching the real AR class.
+      end
+    end
+
+    it "returns an association in full when the host reports it touched" do
+      changes_since({ columns: [], associations: ["organization"] })
+      data = update({ name: "Bob" }, changed_since: since)
+
+      aggregate_failures do
+        expect(data["changedAttributes"]).to include("organization")
+        # Resolves through the AssociationLoader/Preloader codepath, which relies on
+        # `record.is_a?(model)` and `record.class` matching the real AR class.
         expect(data["resource"]["organization"]["name"]).to eql(advisor.organization.name)
+      end
+    end
+
+    it "treats a belongs_to as changed when its foreign key changed" do
+      changes_since({ columns: [], associations: [] })
+      other_organization = FactoryBot.create(:organization)
+      data = update({ organizationId: other_organization.id }, changed_since: since)
+
+      aggregate_failures do
+        expect(data["changedAttributes"]).to include("organizationId", "organization")
+        expect(data["resource"]["organizationId"]).to eql(other_organization.id)
+        expect(data["resource"]["organization"]["name"]).to eql(other_organization.name)
+      end
+    end
+
+    it "reports columns written by the database during the save, with their stored value" do
+      changes_since({ columns: [], associations: [] })
+      ::ActiveRecord::Base.connection.execute(<<~SQL)
+        CREATE FUNCTION advisors_shout_nickname() RETURNS trigger AS $$
+        BEGIN
+          NEW.nickname := upper(NEW.name);
+          RETURN NEW;
+        END
+        $$ LANGUAGE plpgsql;
+        CREATE TRIGGER advisors_shout_nickname BEFORE UPDATE ON advisors
+          FOR EACH ROW EXECUTE FUNCTION advisors_shout_nickname();
+      SQL
+
+      data = update({ name: "Bob" }, changed_since: since)
+
+      aggregate_failures do
+        expect(data["changedAttributes"]).to include("name", "nickname")
+        expect(data["resource"]["nickname"]).to eql("BOB")
       end
     end
   end

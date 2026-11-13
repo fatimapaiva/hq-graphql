@@ -46,8 +46,10 @@ module HQ
           scoped_self = self
 
           build_mutation(action: :update, require_primary_key: true, nil_klass: return_copy) do
-            byebug
             define_method(:resolve) do |**args|
+              # return_copy: taken before anything is read, so a change committed while
+              # this runs is reported again next time rather than missed.
+              synced_at = Time.current if return_copy
               resource = scoped_self.find_record(args, context)
 
               if resource
@@ -61,6 +63,7 @@ module HQ
                 refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:update, resource, context, parents: stored_parents)
                 next ::HQ::GraphQL::RecordAuthorization.payload(refusal) if refusal
 
+                snapshot = resource.attributes if return_copy
                 resource.assign_attributes(attributes)
                 new_parents = ::HQ::GraphQL::RecordAuthorization.parents(resource, context) - stored_parents
                 refusal = ::HQ::GraphQL::RecordAuthorization.refusal(:create, resource, context, parents: new_parents)
@@ -68,12 +71,14 @@ module HQ
 
                 if resource.save
                   if return_copy
-                    changed_attributes = resource.saved_changes.keys
-                    {
-                      resource: ::HQ::GraphQL::ChangedAttributesProxy.wrap(resource, changed_attributes),
-                      changed_attributes: changed_attributes.map { |a| a.to_s.camelize(:lower) },
-                      errors: {},
-                    }
+                    ::HQ::GraphQL::ChangedAttributesProxy.payload(
+                      resource,
+                      snapshot: snapshot,
+                      attributes: attributes,
+                      since: args[:changed_since],
+                      synced_at: synced_at,
+                      context: context
+                    )
                   else
                     {
                       resource: resource,
@@ -96,7 +101,17 @@ module HQ
 
             lazy_load do
               argument :attributes, ::HQ::GraphQL::Inputs[scoped_self.model_name], required: true
-              field :changed_attributes, [String], null: false if return_copy
+              if return_copy
+                # When the client last synced (a previous payload's `syncedAt`). Given,
+                # `resource` only carries what changed since then -- by this save or
+                # anyone else -- listed in `changedAttributes`. Omitted, or too old for
+                # the host to answer, the full record comes back and
+                # `changedAttributes` is null.
+                argument :changed_since, ::GraphQL::Types::ISO8601DateTime, required: false
+                field :changed_attributes, [String], null: true
+                # Nullable: refusals and validation errors return before it is known.
+                field :synced_at, ::GraphQL::Types::ISO8601DateTime, null: true
+              end
             end
           end
         end

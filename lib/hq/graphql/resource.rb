@@ -8,6 +8,7 @@ require "hq/graphql/enum/sort_by"
 require "hq/graphql/field_extension/paginated_arguments"
 require "hq/graphql/filters"
 require "hq/graphql/resource/auto_mutation"
+require "hq/graphql/resource/nullable_copy_fields"
 require "hq/graphql/scalars"
 require "hq/graphql/pagination_connection_type"
 require "hq/graphql/types/date_filter_inputs"
@@ -68,30 +69,41 @@ module HQ
           @input_klass ||= build_input_object
         end
 
-        # NilQuery/`<Name>Copy` is meant to be the same shape as the regular query
-        # object, just with every field nullable — so it must apply the same custom
-        # `query do ... end` block (e.g. field redefinitions, extra arguments) that
-        # the regular query object uses, not just the plain auto-generated fields.
         def nil_query_object
-          @nil_query_object ||= begin
-            options, block = @query_object_options || [{}, nil]
-            const_set(:NilQuery, build_graphql_object(name: "#{graphql_name}Copy", **options, auto_nil: false, &block))
-          end
+          @nil_query_object ||=
+            if return_copy?
+              # With `return_copy: true`, `<Name>Copy` is what the update mutation
+              # returns, so it must be the regular query object's shape -- including
+              # the custom `query do ... end` block (field redefinitions, extra
+              # arguments) -- with every field nullable and gated (see
+              # NullableCopyFields). Every other resource keeps the plain copy type.
+              options, block = @query_object_options || @copy_query_object_options || [{}, nil]
+              const_set(:NilQuery, build_graphql_object(name: "#{graphql_name}Copy", **options, auto_nil: false, nullable_copy: true, &block))
+            else
+              const_set(:NilQuery, build_graphql_object(name: "#{graphql_name}Copy", auto_nil: false))
+            end
         end
 
         def query_object
           @query_object ||= begin
-            qo =
-              if @query_object_options
-                options, block = @query_object_options
-                @query_object_options = nil
-                build_graphql_object(**options, &block)
-              else
-                build_graphql_object
-              end
-            remove_const(:Query) if const_defined?(:Query, false)
-            const_set(:Query, qo)
-          end
+                              qo =
+                                if @query_object_options
+                                  options, block = @query_object_options
+                                  # Kept for a `return_copy: true` copy type built afterwards.
+                                  @copy_query_object_options = @query_object_options
+                                  @query_object_options = nil
+                                  build_graphql_object(**options, &block)
+                                else
+                                  build_graphql_object
+                                end
+                              remove_const(:Query) if const_defined?(:Query, false)
+                              const_set(:Query, qo)
+                            end
+        end
+
+        # Whether the resource's update mutation was declared with `return_copy: true`.
+        def return_copy?
+          !!@return_copy
         end
 
         def sort_fields_enum
@@ -194,13 +206,15 @@ module HQ
         # copy => adds copy operation
         # update => adds update operation
         # destroy => adds destroy operation
-        # return_copy => the update mutation's `resource` field only returns attributes that
-        #   changed as part of the save (everything else comes back nil), using the resource's
-        #   `<Name>Copy` type (all fields nullable) instead of its regular query type. The
-        #   payload also gains a `changedAttributes: [String!]!` field listing which attributes
-        #   changed, so consumers can tell "unchanged" apart from "changed to null".
+        # return_copy => opt-in, off by default. The update mutation takes `changedSince`
+        #   and its `resource` (typed as `<Name>Copy`, every field nullable) only carries
+        #   what changed since then -- by this save, callbacks/triggers, or anyone else
+        #   (see `config.changes_since`) -- listed in `changedAttributes`; everything else
+        #   is null. Without `changedSince` the full record comes back and
+        #   `changedAttributes` is null. Resources without it behave exactly as before.
         def mutations(create: true, copy: true, update: true, destroy: true, return_copy: false)
           scoped_self = self
+          @return_copy = return_copy
           if create
             mutation_klasses["create_#{graphql_name.underscore}"] = build_create
             # new_resource query will be created only if create mutation exist
@@ -456,12 +470,18 @@ module HQ
 
         private
 
-        def build_graphql_object(name: graphql_name, **options, &block)
+        # nullable_copy => builds a `<Name>Copy` type: every field, including the ones
+        #   declared in the `query do ... end` block and has_many lists, is nullable,
+        #   and gated by `ChangedAttributesProxy::FieldGate` so that a
+        #   `return_copy: true` update can leave unchanged fields out.
+        def build_graphql_object(name: graphql_name, nullable_copy: false, **options, &block)
           scoped_graphql_name = name
           scoped_model_name = model_name
           object_class = @query_class || ::HQ::GraphQL.default_object_class || ::GraphQL::Schema::Object
           Class.new(object_class) do
             graphql_name scoped_graphql_name
+
+            extend ::HQ::GraphQL::Resource::NullableCopyFields if nullable_copy
 
             with_model scoped_model_name, **options
 

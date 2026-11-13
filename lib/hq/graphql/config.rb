@@ -19,6 +19,7 @@ module HQ
       :apply_default_scope_to_associations,
       :filter_unauthorized_collection_items,
       :excluded_inputs,
+      :changes_since,
       keyword_init: true
     )
       def initialize(
